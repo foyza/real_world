@@ -3,6 +3,7 @@ import os
 import logging
 import sqlite3
 from datetime import datetime
+from telegram.ext import Updater, CommandHandler
 
 import pandas as pd
 import httpx
@@ -158,16 +159,19 @@ async def set_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ▶️ Запуск бота
 def main():
     logging.basicConfig(level=logging.INFO)
-    app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("strategy", strategy_handler))
-    app.add_handler(CommandHandler("ml_on", ml_on))
-    app.add_handler(CommandHandler("ml_off", ml_off))
-    app.add_handler(CommandHandler("set", set_handler))
-    app.add_handler(CommandHandler("signal", signal_handler))
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    app.run_polling()
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("strategy", strategy_handler))
+    dp.add_handler(CommandHandler("ml_on", ml_on))
+    dp.add_handler(CommandHandler("ml_off", ml_off))
+    dp.add_handler(CommandHandler("set", set_handler))
+    dp.add_handler(CommandHandler("signal", signal_handler))
+
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
     main()
