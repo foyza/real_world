@@ -2,7 +2,7 @@ ta
 pandas
 numpy
 httpx
-python-telegram-bot==13.15
+python-telegram-bot==20.7
 aiohttp
 tqdm
 sqlite-utils
