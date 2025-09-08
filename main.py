@@ -57,26 +57,30 @@ def get_main_keyboard():
 
 
 # === DATA ===
-async def get_twelvedata(asset, count=200):
-    symbol = TWELVE_SYMBOLS.get(asset)
+async def get_twelvedata(asset, interval="1h", count=50):
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": symbol,
-        "interval": "1h",
+        "symbol": asset,
+        "interval": interval,
         "outputsize": count,
         "apikey": TWELVEDATA_API_KEY,
     }
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as r:
-            data = await r.json()
+        async with session.get(url, params=params) as response:
+            data = await response.json()
             if "values" not in data:
-                return None
+                raise ValueError(f"TwelveData API error: {data.get('message', 'no data')}")
             df = pd.DataFrame(data["values"])
             df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.sort_values("datetime")
+            
+            # Приводим к float только те колонки, что есть
             for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col])
-            df = df.sort_values("datetime").reset_index(drop=True)
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col])
+            
             return df
+
 
 
 async def get_news_sentiment(asset: str):
