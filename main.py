@@ -20,11 +20,11 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 
-ASSETS = ['BTC/USD', 'XAU/USD', 'NDX']
+ASSETS = ['BTC/USD', 'XAU/USD', 'ETH/USD']
 TWELVE_SYMBOLS = {
     "BTC/USD": "BTC/USD",
     "XAU/USD": "XAU/USD",
-    "NDX": "NDX",
+    "ETH/USD": "ETH/USD",
 }
 
 logging.basicConfig(level=logging.INFO)
@@ -49,7 +49,7 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔄 Получить сигнал")],
-            [KeyboardButton(text="BTC/USD"), KeyboardButton(text="XAU/USD"), KeyboardButton(text="NDX")],
+            [KeyboardButton(text="BTC/USD"), KeyboardButton(text="XAU/USD"), KeyboardButton(text="ETH/USD")],
             [KeyboardButton(text="🕒 Расписание")]
         ],
         resize_keyboard=True
@@ -85,7 +85,7 @@ async def get_twelvedata(asset, interval="1h", count=50):
 
 async def get_news_sentiment(asset: str):
     """Анализируем новости через NewsAPI + Vader NLP"""
-    query = "bitcoin" if "BTC" in asset else "gold" if "XAU" in asset else "nasdaq"
+    query = "bitcoin" if "BTC" in asset else "gold" if "XAU" in asset else "ETH"
     url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&apiKey={NEWSAPI_KEY}&language=en"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as r:
