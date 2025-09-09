@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 from aiogram.enums import ParseMode
 from dotenv import load_dotenv
@@ -25,8 +26,10 @@ ASSETS = ['BTC/USD', 'XAU/USD', 'ETH/USD']
 logging.basicConfig(level=logging.INFO)
 
 dp = Dispatcher()
-bot = Bot(token=TOKEN, default=types.DefaultBotProperties(parse_mode=ParseMode.HTML))
-
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 user_settings = {}  # {uid: {"asset": ..., "mute": False}}
 
 # === ML MODEL ===
