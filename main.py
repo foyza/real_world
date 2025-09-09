@@ -14,49 +14,45 @@ import os
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 
-# === CONFIG ===
+# CONFIG
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 
 ASSETS = ['BTC/USD', 'XAU/USD', 'ETH/USD']
-TWELVE_SYMBOLS = {
-    "BTC/USD": "BTC/USD",
-    "XAU/USD": "XAU/USD",
-    "ETH/USD": "ETH/USD",
-}
 
 logging.basicConfig(level=logging.INFO)
 
 dp = Dispatcher()
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 
-user_settings = {}  # {uid: {"asset": ...}}
+user_settings = {}  # {uid: {"asset": ..., "muted": bool}}
 
-# === ML MODEL ===
+# ML MODEL 
 model = RandomForestClassifier(n_estimators=100, random_state=42)
 scaler = StandardScaler()
 ml_trained = False
 
-# === NLP SENTIMENT ===
+# NLP SENTIMENT
 nltk.download("vader_lexicon", quiet=True)
 sia = SentimentIntensityAnalyzer()
 
 
-# === UI ===
+# UI 
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔄 Получить сигнал")],
             [KeyboardButton(text="BTC/USD"), KeyboardButton(text="XAU/USD"), KeyboardButton(text="ETH/USD")],
+            [KeyboardButton(text="🔕 Mute"), KeyboardButton(text="🔔 Unmute")],
             [KeyboardButton(text="🕒 Расписание")]
         ],
         resize_keyboard=True
     )
 
 
-# === DATA ===
+# DATA 
 async def get_twelvedata(asset, interval="1h", count=50):
     url = "https://api.twelvedata.com/time_series"
     params = {
@@ -74,36 +70,31 @@ async def get_twelvedata(asset, interval="1h", count=50):
             df["datetime"] = pd.to_datetime(df["datetime"])
             df = df.sort_values("datetime")
             
-            # Приводим к float только те колонки, что есть
             for col in ["open", "high", "low", "close", "volume"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col])
-            
             return df
 
 
-
 async def get_news_sentiment(asset: str):
-    """Анализируем новости через NewsAPI + Vader NLP"""
-    query = "bitcoin" if "BTC" in asset else "gold" if "XAU" in asset else "ETH"
+    query = "bitcoin" if "BTC" in asset else "gold" if "XAU" in asset else "ethereum"
     url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&apiKey={NEWSAPI_KEY}&language=en"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as r:
             data = await r.json()
             if "articles" not in data:
-                return 0  # нейтрально
+                return 0
             scores = []
-            for art in data["articles"][:5]:  # последние 5 новостей
+            for art in data["articles"][:5]:
                 text = art["title"] + " " + (art.get("description") or "")
                 sentiment = sia.polarity_scores(text)
                 scores.append(sentiment["compound"])
             if not scores:
                 return 0
-            avg = np.mean(scores)
-            return avg  # >0 = позитив, <0 = негатив
+            return float(np.mean(scores))
 
 
-# === INDICATORS ===
+# INDICATORS
 def compute_rsi(series, period=14):
     delta = series.diff()
     up = delta.clip(lower=0)
@@ -128,7 +119,7 @@ def add_indicators(df):
     return df.dropna()
 
 
-# === RULE-BASED STRATEGY ===
+# RULE-BASED STRATEGY
 def rule_based_signal(df):
     latest = df.iloc[-1]
     ema_signal = "buy" if latest["ema10"] > latest["ema50"] else "sell"
@@ -136,11 +127,11 @@ def rule_based_signal(df):
     macd_signal = "buy" if latest["macd"] > 0 else "sell"
     signals = [ema_signal, rsi_signal, macd_signal]
     direction = "buy" if signals.count("buy") >= 2 else "sell" if signals.count("sell") >= 2 else "neutral"
-    accuracy = int((signals.count(direction) / 3) * 100) if direction != "neutral" else 66
-    return direction, accuracy
+    accuracy = (signals.count(direction) / 3) * 100 if direction != "neutral" else 50.0
+    return direction, round(accuracy, 2)
 
 
-# === ML TRAINING ===
+# ML TRAINING
 async def train_model(asset="BTC/USD"):
     global ml_trained, model, scaler
     df = await get_twelvedata(asset, count=500)
@@ -160,18 +151,18 @@ async def train_model(asset="BTC/USD"):
 
 def ml_predict(latest_row):
     if not ml_trained:
-        return "neutral", 50
+        return "neutral", 50.0
     X = np.array([[latest_row["ema10"], latest_row["ema50"], latest_row["rsi"], latest_row["macd"]]])
     X = scaler.transform(X)
     prob = model.predict_proba(X)[0]
     if prob[1] > 0.55:
-        return "buy", int(prob[1] * 100)
+        return "buy", round(prob[1] * 100, 2)
     elif prob[0] > 0.55:
-        return "sell", int(prob[0] * 100)
-    return "neutral", 50
+        return "sell", round(prob[0] * 100, 2)
+    return "neutral", 50.0
 
 
-# === SIGNAL ===
+# SIGNAL
 async def send_signal(user_id, asset):
     df = await get_twelvedata(asset, count=50)
     if df is None or len(df) < 50:
@@ -183,11 +174,10 @@ async def send_signal(user_id, asset):
     direction_ml, acc_ml = ml_predict(df.iloc[-1])
     news_score = await get_news_sentiment(asset)
 
-    # Комбинируем 3 источника
-    direction = "neutral"
+    direction, accuracy = "neutral", 50.0
     if direction_rule == direction_ml and direction_rule != "neutral":
         direction = direction_rule
-        accuracy = int((acc_rule + acc_ml) / 2)
+        accuracy = (acc_rule + acc_ml) / 2
     else:
         direction, accuracy = direction_rule, acc_rule
 
@@ -200,7 +190,7 @@ async def send_signal(user_id, asset):
             direction = "sell"
             accuracy += 10
 
-    accuracy = min(100, accuracy)
+    accuracy = min(100.0, accuracy)
     price = df["close"].iloc[-1]
     tp_pct, sl_pct = 2.0, 1.0
     tp_price = round(price * (1 + tp_pct / 100), 2) if direction == "buy" else round(price * (1 - tp_pct / 100), 2)
@@ -215,18 +205,18 @@ async def send_signal(user_id, asset):
             f"Цена: {price}\n"
             f"🟢 TP: {tp_price} (+{tp_pct}%)\n"
             f"🔴 SL: {sl_price} (-{sl_pct}%)\n"
-            f"📊 Точность: {accuracy}%\n"
+            f"📊 Точность: {round(accuracy, 2)}%\n"
             f"📰 Новости: {'позитив' if news_score>0 else 'негатив' if news_score<0 else 'нейтрально'}"
         )
-    await bot.send_message(user_id, msg)
+    mute = user_settings.get(user_id, {}).get("muted", False)
+    await bot.send_message(user_id, msg, disable_notification=mute)
 
 
-# === HANDLERS ===
+# HANDLERS 
 @dp.message(CommandStart())
 async def start(message: types.Message):
-    user_settings[message.from_user.id] = {"asset": "BTC/USD"}
-    await message.answer("Escape the matrix",
-                         reply_markup=get_main_keyboard())
+    user_settings[message.from_user.id] = {"asset": "BTC/USD", "muted": False}
+    await message.answer("Escape the matrix", reply_markup=get_main_keyboard())
 
 
 @dp.message()
@@ -234,22 +224,29 @@ async def handle_buttons(message: types.Message):
     uid = message.from_user.id
     text = message.text
     if uid not in user_settings:
-        user_settings[uid] = {"asset": "BTC/USD"}
+        user_settings[uid] = {"asset": "BTC/USD", "muted": False}
+
     if text == "🔄 Получить сигнал":
         await send_signal(uid, user_settings[uid]["asset"])
     elif text in ASSETS:
         user_settings[uid]["asset"] = text
         await message.answer(f"✅ Актив установлен: {text}")
+    elif text == "🔕 Mute":
+        user_settings[uid]["muted"] = True
+        await message.answer("🔕 Уведомления отключены")
+    elif text == "🔔 Unmute":
+        user_settings[uid]["muted"] = False
+        await message.answer("🔔 Уведомления включены")
     elif text == "🕒 Расписание":
-        await message.answer("Сигналы проверяются каждые 5 минут автоматически.")
+        await message.answer("⏳ Сигналы проверяются каждые 15 минут автоматически.")
 
 
-# === AUTO LOOP ===
+# AUTO LOOP
 async def auto_signal_loop():
     while True:
         for uid, settings in user_settings.items():
             await send_signal(uid, settings["asset"])
-        await asyncio.sleep(300)
+        await asyncio.sleep(900)  # 15 минут
 
 
 async def main():
