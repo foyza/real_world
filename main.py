@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 import os
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
+import joblib
+import time
 
 # ========== CONFIG ==========
 load_dotenv()
@@ -20,10 +22,21 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 
+if not TOKEN or not TWELVEDATA_API_KEY or not NEWSAPI_KEY:
+    raise ValueError("API ключи не установлены в .env")
+
 ASSETS = ["BTC/USD", "XAU/USD", "ETH/USD"]
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Logging
+logger = logging.getLogger("bot")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+console = logging.StreamHandler()
+console.setFormatter(formatter)
+file_handler = logging.FileHandler("bot.log")
+file_handler.setFormatter(formatter)
+logger.addHandler(console)
+logger.addHandler(file_handler)
 
 # aiogram setup
 dp = Dispatcher()
@@ -32,6 +45,9 @@ bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 user_settings: dict = {}  # {user_id: {"asset": ..., "muted": False}}
 
 # ========== ML models ==========
+model_file = "rf_model.joblib"
+scaler_file = "scaler.joblib"
+
 model = RandomForestClassifier(n_estimators=300, class_weight="balanced", n_jobs=-1, random_state=42)
 scaler = StandardScaler()
 ml_trained = False
@@ -53,24 +69,26 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     )
 
 # ========== Data helpers ==========
+async def fetch_json(url, params=None, retries=3):
+    for attempt in range(retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=30) as resp:
+                    return await resp.json()
+        except Exception as e:
+            logger.warning("Request failed (%d/%d): %s", attempt + 1, retries, e)
+            await asyncio.sleep(1)
+    return None
+
 async def get_twelvedata(asset: str, interval: str = "1h", count: int = 1000) -> pd.DataFrame | None:
     url = "https://api.twelvedata.com/time_series"
     params = {"symbol": asset, "interval": interval, "outputsize": count, "apikey": TWELVEDATA_API_KEY}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=30) as resp:
-                data = await resp.json()
-    except Exception as e:
-        logger.exception("TwelveData request failed")
+    data = await fetch_json(url, params=params)
+    if not data or "values" not in data:
+        logger.warning("No data returned for %s", asset)
         return None
-
-    if not isinstance(data, dict) or "values" not in data:
-        logger.warning("TwelveData returned no values: %s", data)
-        return None
-
     df = pd.DataFrame(data["values"])
     df["datetime"] = pd.to_datetime(df["datetime"])
-    # numeric cast only for present columns
     for col in ["open", "high", "low", "close", "volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -78,15 +96,9 @@ async def get_twelvedata(asset: str, interval: str = "1h", count: int = 1000) ->
     return df
 
 async def get_news_sentiment(asset: str) -> float:
-    # return VADER compound average on last 5 articles (english)
     query = "bitcoin" if "BTC" in asset else "gold" if "XAU" in asset else "ethereum"
     url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&apiKey={NEWSAPI_KEY}&language=en&pageSize=5"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=20) as r:
-                data = await r.json()
-    except Exception:
-        return 0.0
+    data = await fetch_json(url)
     if not data or "articles" not in data:
         return 0.0
     scores = []
@@ -127,7 +139,6 @@ def compute_macd(series: pd.Series) -> pd.Series:
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # handle missing columns gracefully
     if "close" not in df.columns:
         raise ValueError("close column missing")
     df["ema10"] = df["close"].ewm(span=10).mean()
@@ -148,7 +159,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ========== Labels ==========
 def make_labels(df: pd.DataFrame, horizon: int = 3, thr: float = 0.008) -> pd.Series:
-    # thr = 0.8% default for 1h horizon
     future_ret = df["close"].shift(-horizon) / df["close"] - 1.0
     labels = pd.Series(0, index=df.index)
     labels[future_ret > thr] = 1
@@ -164,7 +174,7 @@ def rule_based_signal(df: pd.DataFrame):
     votes = [ema_sig, rsi_sig, macd_sig]
     s = sum(votes)
     if s > 0:
-        return "buy", abs(s) / 3.0  # normalized confidence 0..1
+        return "buy", abs(s) / 3.0
     if s < 0:
         return "sell", abs(s) / 3.0
     return "neutral", 0.33
@@ -172,6 +182,13 @@ def rule_based_signal(df: pd.DataFrame):
 # ========== Training ==========
 async def train_model_all(assets=ASSETS, count=1000, horizon=3, thr=0.008):
     global ml_trained, model, scaler
+    if os.path.exists(model_file) and os.path.exists(scaler_file):
+        model = joblib.load(model_file)
+        scaler = joblib.load(scaler_file)
+        ml_trained = True
+        logger.info("✅ ML model loaded from disk")
+        return
+
     dfs = []
     for a in assets:
         df = await get_twelvedata(a, count=count)
@@ -196,12 +213,13 @@ async def train_model_all(assets=ASSETS, count=1000, horizon=3, thr=0.008):
     X = df_all[feature_cols].values
     X_scaled = scaler.fit_transform(X)
     y = df_all["label"].values
-    # train
     model.fit(X_scaled, y)
+    joblib.dump(model, model_file)
+    joblib.dump(scaler, scaler_file)
     ml_trained = True
     logger.info("✅ ML trained on %d samples", len(y))
 
-# ========== Prediction helper ==========
+# ========== ML prediction ==========
 def ml_predict_row(row: pd.Series):
     if not ml_trained:
         return "neutral", 0.5
@@ -214,12 +232,7 @@ def ml_predict_row(row: pd.Series):
     Xs = scaler.transform(X)
     probs = model.predict_proba(Xs)[0]
     classes = model.classes_
-    # build dictionary class->prob
     prob_map = {int(c): float(p) for c, p in zip(classes, probs)}
-    buy_p = prob_map.get(1, 0.0)
-    sell_p = prob_map.get(-1, 0.0)
-    neutral_p = prob_map.get(0, 0.0)
-    # choose highest
     best_class = max(prob_map.items(), key=lambda x: x[1])[0]
     conf = prob_map[best_class]
     if best_class == 1:
@@ -228,28 +241,13 @@ def ml_predict_row(row: pd.Series):
         return "sell", conf
     return "neutral", conf
 
-# ========== Compose final decision and TP/SL ==========
-def combine_scores(ml_dir: str, ml_conf: float, rule_dir: str, rule_conf: float, news_score: float):
-    # ml_conf in 0..1, rule_conf 0..1, news_score ~ [-1,1]
-    w_ml = 0.5
-    w_rule = 0.3
-    w_news = 0.2
-
-    # map directions to numeric
+# ========== Combine scores ==========
+def combine_scores(ml_dir, ml_conf, rule_dir, rule_conf, news_score):
+    w_ml, w_rule, w_news = 0.5, 0.3, 0.2
     def dir_to_num(d, conf):
-        if d == "buy":
-            return conf
-        if d == "sell":
-            return -conf
-        return 0.0
-
-    ml_val = dir_to_num(ml_dir, ml_conf)
-    rule_val = dir_to_num(rule_dir, rule_conf)
-    news_val = np.clip(news_score, -1.0, 1.0)  # already -1..1
-
-    total = w_ml * ml_val + w_rule * rule_val + w_news * news_val
-    # final direction threshold
-    thresh = 0.35  # tuned: higher -> fewer signals but higher precision
+        return conf if d=="buy" else -conf if d=="sell" else 0
+    total = w_ml*dir_to_num(ml_dir, ml_conf) + w_rule*dir_to_num(rule_dir, rule_conf) + w_news*np.clip(news_score, -1, 1)
+    thresh = 0.35
     if total >= thresh:
         return "buy", float(total)
     if total <= -thresh:
@@ -257,56 +255,42 @@ def combine_scores(ml_dir: str, ml_conf: float, rule_dir: str, rule_conf: float,
     return "neutral", float(abs(total))
 
 def compute_tp_sl(price: float, atr: float, max_tp_atr=2.0, max_sl_atr=1.0):
-    # TP = price + max_tp_atr * atr  (for buy)
-    # SL = price - max_sl_atr * atr
-    tp = price + max_tp_atr * atr
-    sl = price - max_sl_atr * atr
-    tp_pct = (tp / price - 1.0) * 100
-    sl_pct = (1.0 - sl / price) * 100
-    return round(tp, 6), round(sl, 6), round(tp_pct, 2), round(sl_pct, 2)
+    tp = price + max_tp_atr*atr
+    sl = price - max_sl_atr*atr
+    tp_pct = (tp/price-1)*100
+    sl_pct = (1 - sl/price)*100
+    return round(tp,6), round(sl,6), round(tp_pct,2), round(sl_pct,2)
 
 # ========== Send signal ==========
 async def send_signal(uid: int, asset: str):
     try:
         df = await get_twelvedata(asset, count=150)
         if df is None or len(df) < 60:
-            await bot.send_message(uid, f"⚠️ Не удалось получить достаточные данные для {asset}")
+            await bot.send_message(uid, f"⚠️ Недостаточно данных для {asset}")
             return
         df = add_indicators(df)
-        # rule
         rule_dir, rule_conf = rule_based_signal(df)
-        # ml
         ml_dir, ml_conf = ml_predict_row(df.iloc[-1])
-        # news
-        news = await get_news_sentiment(asset)  # [-1..1]
-        # combine
+        news = await get_news_sentiment(asset)
         final_dir, final_conf = combine_scores(ml_dir, ml_conf, rule_dir, rule_conf, news)
-        # require ML minimum confidence and combined confidence
-        send_threshold = 0.55  # require >55% combined-ish to send
-        if final_dir == "neutral" or final_conf < send_threshold:
-            # don't spam: only notify when clear
-            await bot.send_message(uid, f"⚠️ По {asset} нет уверенного сигнала (score {final_conf:.2f}).")
+        send_threshold = 0.55
+        if final_dir=="neutral" or final_conf<send_threshold:
+            await bot.send_message(uid, f"⚠️ Нет уверенного сигнала для {asset} (score {final_conf:.2f})")
             return
-
         price = float(df["close"].iloc[-1])
-        atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else (0.0)
-        # fallback ATR-> percent if zero: use volatility14
-        if not atr or np.isnan(atr) or atr <= 0:
-            atr = float(df["volatility14"].iloc[-1]) if "volatility14" in df.columns else price * 0.01
-
-        tp_price, sl_price, tp_pct, sl_pct = compute_tp_sl(price, atr, max_tp_atr=2.0, max_sl_atr=1.0)
-        accuracy_pct = min(99.99, round(final_conf * 100, 2))
-        news_txt = "позитив" if news > 0.05 else "негатив" if news < -0.05 else "нейтрально"
-
+        atr = float(df["atr"].iloc[-1]) if "atr" in df.columns else price*0.01
+        tp_price, sl_price, tp_pct, sl_pct = compute_tp_sl(price, atr)
+        news_txt = "позитив" if news>0.05 else "негатив" if news<-0.05 else "нейтрально"
+        accuracy_pct = min(99.99, round(final_conf*100,2))
         msg = (
             f"📢 Сигнал — <b>{asset}</b>\n"
             f"Направление: <b>{final_dir.upper()}</b>\n"
             f"Цена входа: <b>{price}</b>\n"
             f"🟢 TP: {tp_price} (+{tp_pct}%)\n"
             f"🔴 SL: {sl_price} (-{sl_pct}%)\n"
-            f"📊 Надёжность (оценка): <b>{accuracy_pct}%</b>\n"
+            f"📊 Надёжность: <b>{accuracy_pct}%</b>\n"
             f"📰 Новости: {news_txt}\n\n"
-            f"🧾 Дополнительно: ML={ml_dir}({ml_conf:.2f}), Rule={rule_dir}({rule_conf:.2f}), News={news:.2f}"
+            f"🧾 ML={ml_dir}({ml_conf:.2f}), Rule={rule_dir}({rule_conf:.2f}), News={news:.2f}"
         )
         muted = user_settings.get(uid, {}).get("muted", False)
         await bot.send_message(uid, msg, disable_notification=muted)
@@ -324,11 +308,9 @@ async def start_handler(msg: types.Message):
 async def all_messages_handler(msg: types.Message):
     uid = msg.from_user.id
     text = (msg.text or "").strip()
-    # initialize
     if uid not in user_settings:
         user_settings[uid] = {"asset": "BTC/USD", "muted": False}
     lower = text.lower()
-    # robust mute/unmute detection
     if "mute" in lower or text.startswith("🔕") or text.startswith("🔇"):
         user_settings[uid]["muted"] = True
         await msg.answer("🔕 Автосигналы отключены.")
@@ -337,38 +319,33 @@ async def all_messages_handler(msg: types.Message):
         user_settings[uid]["muted"] = False
         await msg.answer("🔔 Автосигналы включены.")
         return
-    if text == "🔄 Получить сигнал":
+    if text=="🔄 Получить сигнал":
         await send_signal(uid, user_settings[uid]["asset"])
         return
     if text in ASSETS:
         user_settings[uid]["asset"] = text
         await msg.answer(f"✅ Актив установлен: {text}")
         return
-    if text == "🕒 Расписание":
-        await msg.answer("Авто-проверка выполняется каждые 15 минут.")
+    if text=="🕒 Расписание":
+        await msg.answer("Авто-проверка каждые 15 минут.")
         return
-    # fallback: ignore other messages
-    return
 
 # ========== Auto loop ==========
 async def auto_signal_loop():
     while True:
         try:
-            for uid, s in list(user_settings.items()):
-                if not s.get("muted", False):
-                    await send_signal(uid, s["asset"])
+            tasks = [send_signal(uid, s["asset"]) for uid,s in user_settings.items() if not s.get("muted",False)]
+            if tasks:
+                await asyncio.gather(*tasks)
         except Exception:
             logger.exception("auto loop error")
         await asyncio.sleep(900)
 
 # ========== Main ==========
 async def main():
-    # train on all assets (may take some seconds)
     await train_model_all()
-    # start auto loop
     asyncio.create_task(auto_signal_loop())
-    # start polling
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(main())
