@@ -1,21 +1,24 @@
+# Используем официальный образ Python
 FROM python:3.11-slim
 
-# Set workdir
+# Устанавливаем зависимости для работы pip и системы
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Устанавливаем рабочую директорию
 WORKDIR /app
 
-# Copy requirements
+# Копируем зависимости и ставим их
 COPY requirements.txt .
-
-# Upgrade pip and install dependencies
-RUN pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project
+# Копируем весь код
 COPY . .
 
-# Environment variables
-# TELEGRAM_TOKEN, TWELVEDATA_API_KEY, NEWSAPI_KEY
+# Экспорт переменных окружения (будут браться из .env при деплое)
 ENV PYTHONUNBUFFERED=1
 
-# Run bot
+# Запуск бота
 CMD ["python", "main.py"]
+
