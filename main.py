@@ -1,234 +1,242 @@
-import asyncio
+import os
 import logging
-import aiohttp
+import asyncio
+import httpx
 import pandas as pd
 import numpy as np
+from datetime import datetime
+from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import CommandStart
-from aiogram.enums import ParseMode
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.preprocessing import StandardScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
-from tensorflow.keras.optimizers import Adam
-from dotenv import load_dotenv
-import os
-import nltk
-from nltk.sentiment import SentimentIntensityAnalyzer
 
-# === CONFIG ===
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import ta
+
+# ===============================
+# Загрузка окружения и логирование
+# ===============================
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
-ASSETS = ['BTC/USD', 'XAU/USD', 'ETH/USD']
+API_KEY = os.getenv("TWELVEDATA_API_KEY")
+
+if not TOKEN or not API_KEY:
+    raise ValueError("TELEGRAM_TOKEN или TWELVEDATA_API_KEY не найдены в .env")
 
 logging.basicConfig(level=logging.INFO)
+
+# ===============================
+# Инициализация бота и диспетчера
+# ===============================
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
-bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
-user_settings = {}  # {uid: {"asset": ... , "muted": False}}
 
-# === ML + LSTM ===
-model_gb = GradientBoostingClassifier(n_estimators=200, learning_rate=0.05, max_depth=4, random_state=42)
-scaler = StandardScaler()
-model_lstm = None
-ml_trained = False
+# ===============================
+# Глобальные структуры
+# ===============================
+user_settings = {}  # {uid: {"asset": str, "muted": bool}}
+model = None
+scaler = None
 
-# === NLP ===
-nltk.download("vader_lexicon", quiet=True)
-sia = SentimentIntensityAnalyzer()
+# ===============================
+# Клавиатура
+# ===============================
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📈 Сигнал")],
+        [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="🔕 Вкл/Выкл уведомления")],
+        [KeyboardButton(text="💾 Экспорт сигналов")]
+    ],
+    resize_keyboard=True
+)
 
-# === UI ===
-def get_main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔄 Получить сигнал")],
-            [KeyboardButton(text="BTC/USD"), KeyboardButton(text="XAU/USD"), KeyboardButton(text="ETH/USD")],
-            [KeyboardButton(text="🔕 Mute"), KeyboardButton(text="🔔 Unmute")]
-        ], 
-        resize_keyboard=True
+# ===============================
+# Функции работы с данными
+# ===============================
+async def fetch_data(symbol: str, interval="1h", outputsize=100):
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize={outputsize}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url)
+        data = r.json()
+    if "values" not in data:
+        return None
+    df = pd.DataFrame(data["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime")
+    df["close"] = df["close"].astype(float)
+    return df
+
+# ===============================
+# ML-модель
+# ===============================
+def prepare_features(df: pd.DataFrame):
+    df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+    df["ema"] = ta.trend.EMAIndicator(df["close"], window=14).ema_indicator()
+    df = df.dropna()
+    X = df[["rsi", "ema"]].values
+    y = np.where(df["close"].shift(-1) > df["close"], 1, 0)
+    y = y[:-1]
+    X = X[:-1]
+    return X, y
+
+def train_model(df: pd.DataFrame):
+    global model, scaler
+    X, y = prepare_features(df)
+    X_train, _, y_train, _ = train_test_split(X, y, test_size=0.2, random_state=42)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    model = LogisticRegression()
+    model.fit(X_train, y_train)
+
+# ===============================
+# Smart Money Concepts (SMC)
+# ===============================
+def smc_analysis(df: pd.DataFrame):
+    recent = df.tail(20)
+    high = recent["close"].max()
+    low = recent["close"].min()
+    last = recent["close"].iloc[-1]
+    if last >= high:
+        return "🟢 Ликвидность выбита сверху (бычий сценарий)"
+    elif last <= low:
+        return "🔴 Ликвидность выбита снизу (медвежий сценарий)"
+    else:
+        return "⚪ Цена внутри диапазона (наблюдаем)"
+
+# ===============================
+# Технический анализ (TA)
+# ===============================
+def technical_analysis(df: pd.DataFrame):
+    rsi = ta.momentum.RSIIndicator(df["close"]).rsi().iloc[-1]
+    ema = ta.trend.EMAIndicator(df["close"], window=14).ema_indicator().iloc[-1]
+    ma = ta.trend.SMAIndicator(df["close"], window=50).sma_indicator().iloc[-1]
+    last = df["close"].iloc[-1]
+
+    signals = []
+    if rsi < 30:
+        signals.append("🟢 RSI перепродан → BUY")
+    elif rsi > 70:
+        signals.append("🔴 RSI перекуплен → SELL")
+
+    if last > ema:
+        signals.append("🟢 Цена выше EMA → BUY")
+    else:
+        signals.append("🔴 Цена ниже EMA → SELL")
+
+    if last > ma:
+        signals.append("🟢 Цена выше SMA(50) → BUY")
+    else:
+        signals.append("🔴 Цена ниже SMA(50) → SELL")
+
+    return "\n".join(signals)
+
+# ===============================
+# Отправка сигнала пользователю
+# ===============================
+async def send_signal(user_id: int):
+    asset = user_settings.get(user_id, {}).get("asset", "AAPL")
+    df = await fetch_data(asset)
+    if df is None or len(df) < 50:
+        await bot.send_message(user_id, f"Не удалось получить данные по {asset}")
+        return
+
+    if model is None:
+        train_model(df)
+
+    # ML прогноз
+    X, _ = prepare_features(df)
+    X_scaled = scaler.transform([X[-1]])
+    pred = model.predict(X_scaled)[0]
+    ml_direction = "🟢 BUY" if pred == 1 else "🔴 SELL"
+
+    # Анализ
+    smc_text = smc_analysis(df)
+    ta_text = technical_analysis(df)
+
+    signal = (
+        f"📊 Сигнал по {asset}\n"
+        f"{ml_direction} (ML-модель)\n\n"
+        f"{smc_text}\n\n"
+        f"📉 Технический анализ:\n{ta_text}\n\n"
+        f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
+    await bot.send_message(user_id, signal)
 
-# === DATA ===
-async def get_twelvedata(asset, interval="1h", count=150):
-    url = "https://api.twelvedata.com/time_series"
-    params = {"symbol": asset, "interval": interval, "outputsize": count, "apikey": TWELVEDATA_API_KEY}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as response:
-            data = await response.json()
-            if "values" not in data:
-                return None
-            df = pd.DataFrame(data["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.sort_values("datetime")
-            for col in ["open", "high", "low", "close", "volume"]:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col])
-                else:
-                    df[col] = 0  # Заглушка
-            return df
+    # Экспорт в CSV
+    with open("signals.csv", "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now()},{asset},{ml_direction},{smc_text.replace(',', ' ')},{ta_text.replace(',', ' ')}\n")
 
-async def get_news_sentiment(asset):
-    # фильтр только сильных новостей
-    query = "bitcoin" if "BTC" in asset else "gold" if "XAU" in asset else "ethereum"
-    url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&apiKey={NEWSAPI_KEY}&language=en"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as r:
-            data = await r.json()
-            if "articles" not in data:
-                return 0
-            scores = []
-            for art in data["articles"][:5]:
-                title = art.get("title","").lower()
-                description = art.get("description","").lower()
-                if any(word in title+description for word in ["fed","cpi","interest","regulation","etf"]):
-                    text = art.get("title","") + " " + art.get("description","")
-                    scores.append(sia.polarity_scores(text)["compound"])
-            return float(np.mean(scores)) if scores else 0
-
-# === INDICATORS ===
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.rolling(period).mean()
-    ma_down = down.rolling(period).mean()
-    rs = ma_up / ma_down
-    return 100 - (100 / (1 + rs))
-
-def compute_macd(series):
-    ema12 = series.ewm(span=12, adjust=False).mean()
-    ema26 = series.ewm(span=26, adjust=False).mean()
-    return ema12 - ema26
-
-def compute_atr(high, low, close, period=14):
-    tr = pd.concat([high-low, abs(high-close.shift()), abs(low-close.shift())], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-def compute_obv(close, volume):
-    obv = [0]
-    for i in range(1,len(close)):
-        obv.append(obv[-1]+volume.iloc[i] if close.iloc[i]>close.iloc[i-1] else obv[-1]-volume.iloc[i] if close.iloc[i]<close.iloc[i-1] else obv[-1])
-    return pd.Series(obv, index=close.index)
-
-def compute_bollinger(series, period=20, dev=2):
-    ma = series.rolling(period).mean()
-    std = series.rolling(period).std()
-    return ma + dev*std, ma - dev*std
-
-def add_indicators(df):
-    df = df.copy()
-    df["ema10"] = df["close"].ewm(span=10).mean()
-    df["ema50"] = df["close"].ewm(span=50).mean()
-    df["rsi"] = compute_rsi(df["close"])
-    df["macd"] = compute_macd(df["close"])
-    df["atr"] = compute_atr(df["high"], df["low"], df["close"])
-    df["bb_upper"], df["bb_lower"] = compute_bollinger(df["close"])
-    if "volume" in df.columns:
-        df["obv"] = compute_obv(df["close"], df["volume"])
-    else:
-        df["obv"] = 0
-    return df.dropna()
-
-# === ML TRAINING ===
-async def train_models(asset="BTC/USD"):
-    global ml_trained, model_gb, scaler, model_lstm
-    df = await get_twelvedata(asset, count=500)
-    if df is None: return
-    df = add_indicators(df)
-    df["target"] = (df["close"].shift(-3) > df["close"]).astype(int)
-    features = df[["ema10","ema50","rsi","macd","atr","obv"]].iloc[:-3]
-    labels = df["target"].iloc[:-3]
-    X = scaler.fit_transform(features)
-    y = labels
-    model_gb.fit(X, y)
-    
-    # LSTM
-    X_lstm = np.expand_dims(X, axis=1)
-    model_lstm = Sequential([
-        LSTM(32,input_shape=(X_lstm.shape[1],X_lstm.shape[2])),
-        Dense(1,activation="sigmoid")
-    ])
-    model_lstm.compile(optimizer=Adam(0.001), loss="binary_crossentropy")
-    model_lstm.fit(X_lstm, y, epochs=3, verbose=0)
-    
-    ml_trained = True
-    logging.info("✅ ML + LSTM модели обучены")
-
-# === SIGNAL ===
-async def send_signal(uid, asset):
-    df = await get_twelvedata(asset)
-    if df is None or len(df)<50:
-        await bot.send_message(uid, f"⚠️ Нет данных для {asset}")
-        return
-    df = add_indicators(df)
-    dir_ml, acc_ml = "neutral", 50
-    if ml_trained:
-        latest = df[["ema10","ema50","rsi","macd","atr","obv"]].iloc[-1]
-        X = scaler.transform([latest])
-        prob_gb = model_gb.predict_proba(X)[0]
-        prob_lstm = model_lstm.predict(np.expand_dims(X,axis=1))[0][0]
-        prob = (prob_gb[1]+prob_lstm)/2
-        if prob>0.55: dir_ml="buy"
-        elif prob<0.45: dir_ml="sell"
-        acc_ml = int(prob*100)
-    
-    news_score = await get_news_sentiment(asset)
-    direction = dir_ml
-    accuracy = acc_ml
-    if news_score>0.15 and direction!="sell":
-        direction="buy"
-        accuracy=min(100,accuracy+10)
-    elif news_score<-0.15 and direction!="buy":
-        direction="sell"
-        accuracy=min(100,accuracy+10)
-    
-    price = df["close"].iloc[-1]
-    atr = df["atr"].iloc[-1]
-    tp_price = round(price + atr*2 if direction=="buy" else price - atr*2,2)
-    sl_price = round(price - atr*1 if direction=="buy" else price + atr*1,2)
-    
-    msg = f"📢 Сигнал для <b>{asset}</b>\nНаправление: <b>{direction.upper()}</b>\nЦена: {price}\n🟢 TP: {tp_price}\n🔴 SL: {sl_price}\n📊 Точность: {accuracy}%\n📰 Новости: {'позитив' if news_score>0 else 'негатив' if news_score<0 else 'нейтрально'}"
-    muted = user_settings.get(uid,{}).get("muted",False)
-    await bot.send_message(uid,msg,disable_notification=muted)
-
-# === HANDLERS ===
+# ===============================
+# Хэндлеры
+# ===============================
 @dp.message(CommandStart())
-async def start(message: types.Message):
-    user_settings[message.from_user.id] = {"asset":"BTC/USD","muted":False}
-    await message.answer("Escape the matrix.",reply_markup=get_main_keyboard())
+async def start_cmd(message: types.Message):
+    if message.from_user.id not in user_settings:
+        user_settings[message.from_user.id] = {"asset": "AAPL", "muted": False}
+    await message.answer("Привет! Я бот для трейдинга (SMC + TA + ML) 📈", reply_markup=main_kb)
+
+@dp.message(lambda m: m.text == "📈 Сигнал")
+async def signal_cmd(message: types.Message):
+    await send_signal(message.from_user.id)
+
+@dp.message(lambda m: m.text == "⚙️ Настройки")
+async def settings_cmd(message: types.Message):
+    if message.from_user.id not in user_settings:
+        user_settings[message.from_user.id] = {"asset": "AAPL", "muted": False}
+    await message.answer("Напиши тикер актива (например, AAPL, BTC/USD):")
+
+@dp.message(lambda m: m.text == "🔕 Вкл/Выкл уведомления")
+async def mute_cmd(message: types.Message):
+    uid = message.from_user.id
+    if uid not in user_settings:
+        user_settings[uid] = {"asset": "AAPL", "muted": False}
+    user_settings[uid]["muted"] = not user_settings[uid]["muted"]
+    status = "🔔 Включены" if not user_settings[uid]["muted"] else "🔕 Выключены"
+    await message.answer(f"Уведомления: {status}")
+
+@dp.message(lambda m: m.text == "💾 Экспорт сигналов")
+async def export_cmd(message: types.Message):
+    if os.path.exists("signals.csv"):
+        await message.answer_document(types.FSInputFile("signals.csv"))
+    else:
+        await message.answer("Сигналы пока не сохранены.")
 
 @dp.message()
-async def handle_buttons(message: types.Message):
+async def custom_asset(message: types.Message):
     uid = message.from_user.id
-    text = message.text
-    if uid not in user_settings: user_settings[uid] = {"asset":"BTC/USD","muted":False}
-    if text=="🔄 Получить сигнал":
-        await send_signal(uid,user_settings[uid]["asset"])
-    elif text in ASSETS:
-        user_settings[uid]["asset"] = text
-        await message.answer(f"✅ Актив установлен: {text}")
-    elif text=="🔕 Mute":
-        user_settings[uid]["muted"]=True
-        await message.answer("🔕 Уведомления отключены")
-    elif text=="🔔 Unmute":
-        user_settings[uid]["muted"]=False
-        await message.answer("🔔 Уведомления включены")
+    if uid in user_settings:
+        user_settings[uid]["asset"] = message.text.strip().upper()
+        await message.answer(f"Ассет изменён на {user_settings[uid]['asset']}")
 
-# === AUTO LOOP ===
-async def auto_signal_loop():
-    while True:
-        for uid,settings in user_settings.items():
-            await send_signal(uid,settings["asset"])
-        await asyncio.sleep(900)
+# ===============================
+# Планировщик
+# ===============================
+async def scheduler_task():
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        lambda: [asyncio.create_task(send_signal(uid)) for uid, s in user_settings.items() if not s["muted"]],
+        "interval",
+        minutes=60
+    )
+    scheduler.start()
 
+# ===============================
+# Точка входа
+# ===============================
 async def main():
-    await train_models("BTC/USD")
-    loop = asyncio.get_event_loop()
-    loop.create_task(auto_signal_loop())
+    await scheduler_task()
     await dp.start_polling(bot)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     asyncio.run(main())
+
