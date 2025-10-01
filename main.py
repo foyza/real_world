@@ -62,7 +62,7 @@ main_kb = ReplyKeyboardMarkup(
 # ===============================
 # Функции работы с данными
 # ===============================
-async def fetch_data(symbol: str, interval="1h", outputsize=100):
+async def fetch_data(symbol: str, interval="1h", outputsize=150):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize={outputsize}"
     async with httpx.AsyncClient() as client:
         r = await client.get(url)
@@ -183,7 +183,7 @@ async def send_signal(user_id: int):
 async def start_cmd(message: types.Message):
     if message.from_user.id not in user_settings:
         user_settings[message.from_user.id] = {"asset": "AAPL", "muted": False}
-    await message.answer("Привет! Я бот для трейдинга (SMC + TA + ML) 📈", reply_markup=main_kb)
+    await message.answer("Escape the MATRIX", reply_markup=main_kb)
 
 @dp.message(lambda m: m.text == "📈 Сигнал")
 async def signal_cmd(message: types.Message):
